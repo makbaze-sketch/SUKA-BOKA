@@ -1,136 +1,174 @@
-import os
+import asyncio
 import json
-import requests
-from flask import Flask, request
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    PreCheckoutQuery,
+    LabeledPrice,
+)
+from aiogram.filters import Command
 
-TOKEN = os.getenv("TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-render-url.onrender.com/webhook
+TOKEN = "YOUR_BOT_TOKEN"
 ADMIN_CHANNEL = -1003371815477
 
-BOT_API = f"https://api.telegram.org/bot{TOKEN}"
+PRICE_MAIN = 300
+PRICE_EXTRA = 50
 
-app = Flask(__name__)
+TITLE_MAIN = "Все локации"
+TITLE_EXTRA = "Доп. актив"
+
+DESC_MAIN = "Основной товар за 300⭐"
+DESC_EXTRA = "Дополнительный товар за 50⭐"
 
 BUYERS_FILE = "buyers.json"
 
 
-# ---------------- JSON UTILS ----------------
-
-def load_buyers():
-    if not os.path.exists(BUYERS_FILE):
-        return {}
+# ---------------- UTILS ----------------
+def load_buyers() -> dict:
     try:
         with open(BUYERS_FILE, "r") as f:
             return json.load(f)
     except:
         return {}
 
-def save_buyers(data):
+
+def save_buyers(data: dict):
     with open(BUYERS_FILE, "w") as f:
         json.dump(data, f)
 
 
-# ---------------- TELEGRAM UTILS ----------------
-
-def tg(method, data=None):
-    return requests.post(f"{BOT_API}/{method}", json=data)
-
-
-def send_message(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    tg("sendMessage", payload)
-
-
-def notify_admin(user, item, price):
-    text = (
-        f"📩 Новый заказ!\n"
-        f"Покупатель: @{user.get('username', 'нет юзернейма')}\n"
-        f"ID: {user['id']}\n"
-        f"Товар: {item}\n"
-        f"Оплата: {price}⭐"
-    )
-    send_message(ADMIN_CHANNEL, text)
-
-
-# ---------------- BUTTON MENUS ----------------
-
-def main_menu(user_id):
+def user_has_main(user_id: int) -> bool:
     buyers = load_buyers()
-    bought_main = str(user_id) in buyers
+    return str(user_id) in buyers
 
+
+def add_main_buyer(user_id: int):
+    buyers = load_buyers()
+    buyers[str(user_id)] = True
+    save_buyers(buyers)
+
+
+# ---------------- KEYBOARD ----------------
+def main_keyboard(user_id: int):
     buttons = [
-        [{"text": "Купить Все Локации — 300⭐", "callback_data": "buy_300"}]
+        [InlineKeyboardButton(
+            text=f"Купить «{TITLE_MAIN}» — {PRICE_MAIN}⭐",
+            callback_data="buy_main"
+        )]
     ]
 
-    if bought_main:
-        buttons.append([{"text": "Купить Доп. товар — 50⭐", "callback_data": "buy_50"}])
+    if user_has_main(user_id):
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"Купить «{TITLE_EXTRA}» — {PRICE_EXTRA}⭐",
+                callback_data="buy_extra"
+            )
+        ])
 
-    return {"inline_keyboard": buttons}
-
-
-# ---------------- WEBHOOK HANDLER ----------------
-
-@app.route("/", methods=["GET"])
-def root():
-    return "Bot is running."
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = request.json
-
-    # ---------------- MESSAGE ----------------
-    if "message" in update:
-        msg = update["message"]
-        user = msg["from"]
-        chat_id = msg["chat"]["id"]
-
-        send_message(chat_id, "Меню:", reply_markup=main_menu(user["id"]))
-        return "ok"
-
-    # ---------------- CALLBACK ----------------
-    if "callback_query" in update:
-        query = update["callback_query"]
-        data = query["data"]
-        user = query["from"]
-        chat_id = query["message"]["chat"]["id"]
-        user_id = str(user["id"])
-
-        buyers = load_buyers()
-
-        # Покупка за 300
-        if data == "buy_300":
-            if user_id not in buyers:
-                buyers[user_id] = {"main": True}
-                save_buyers(buyers)
-                notify_admin(user, "Все Локации", 300)
-
-            send_message(chat_id, "Вы купили Все Локации!", reply_markup=main_menu(user_id))
-
-        # Покупка за 50
-        elif data == "buy_50":
-            if user_id not in buyers:
-                send_message(chat_id, "Сначала купите основной товар за 300⭐")
-                return "ok"
-
-            notify_admin(user, "Дополнительный товар", 50)
-            send_message(chat_id, "Вы купили Доп. товар!", reply_markup=main_menu(user_id))
-
-        return "ok"
-
-    return "ok"
+# ---------------- AIOGRAM SETUP ----------------
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
 
-# ---------------- WEBHOOK SETUP ----------------
+# ---------------- HANDLERS ----------------
+@dp.message(Command("start"))
+async def start_handler(msg: Message):
+    kb = main_keyboard(msg.from_user.id)
+    await msg.answer("Меню:", reply_markup=kb)
 
-def set_webhook():
-    url = f"{WEBHOOK_URL}/webhook"
-    tg("setWebhook", {"url": url})
-    print("Webhook установлен:", url)
+
+@dp.callback_query(F.data == "buy_main")
+async def buy_main(callback):
+    user_id = callback.from_user.id
+
+    prices = [LabeledPrice(label=TITLE_MAIN, amount=PRICE_MAIN)]
+
+    await bot.send_invoice(
+        chat_id=user_id,
+        title=TITLE_MAIN,
+        description=DESC_MAIN,
+        currency="XTR",
+        prices=prices,
+        payload="main"
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "buy_extra")
+async def buy_extra(callback):
+    user_id = callback.from_user.id
+
+    if not user_has_main(user_id):
+        await callback.answer("Сначала купите Все Локации за 300⭐", show_alert=True)
+        return
+
+    prices = [LabeledPrice(label=TITLE_EXTRA, amount=PRICE_EXTRA)]
+
+    await bot.send_invoice(
+        chat_id=user_id,
+        title=TITLE_EXTRA,
+        description=DESC_EXTRA,
+        currency="XTR",
+        prices=prices,
+        payload="extra"
+    )
+
+    await callback.answer()
+
+
+# ---------------- PAYMENT ----------------
+@dp.pre_checkout_query()
+async def checkout(pre: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(msg: Message):
+    user = msg.from_user
+    payload = msg.successful_payment.invoice_payload
+
+    if payload == "main":
+        add_main_buyer(user.id)
+        text_user = "Вы купили Все Локации!"
+        text_admin = (
+            f"📩 Новый заказ!\n"
+            f"Покупатель: @{user.username or 'нет username'}\n"
+            f"ID: {user.id}\n"
+            f"Товар: Все Локации\n"
+            f"Оплата: {PRICE_MAIN}⭐"
+        )
+
+    elif payload == "extra":
+        text_user = "Вы купили Доп. товар!"
+        text_admin = (
+            f"📩 Новый заказ!\n"
+            f"Покупатель: @{user.username or 'нет username'}\n"
+            f"ID: {user.id}\n"
+            f"Товар: Доп. актив\n"
+            f"Оплата: {PRICE_EXTRA}⭐"
+        )
+
+    else:
+        return
+
+    await msg.answer(text_user)
+    await bot.send_message(ADMIN_CHANNEL, text_admin)
+
+    # обновить меню
+    await msg.answer("Меню:", reply_markup=main_keyboard(user.id))
+
+
+# ---------------- START ----------------
+async def main():
+    print("Bot started.")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    set_webhook()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    asyncio.run(main())
