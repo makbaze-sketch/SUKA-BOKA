@@ -1,13 +1,13 @@
 import json
-import logging
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
-import os
+import time
+import requests
+from flask import Flask, request
 
-logging.basicConfig(level=logging.INFO)
-
-TOKEN = os.getenv("TOKEN")
+TOKEN = "YOUR_TOKEN"
 ADMIN_CHANNEL = -1003371815477
+
+URL = f"https://api.telegram.org/bot{TOKEN}"
+BOT_ID = TOKEN.split(":")[0]
 
 PRICE_MAIN = 300
 PRICE_EXTRA = 50
@@ -17,11 +17,10 @@ TITLE_EXTRA = "Дополнительный актив"
 
 BUYERS_FILE = "buyers.json"
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+app = Flask(__name__)
 
 
-# ---------------- JSON STORAGE ----------------
+# ---------------- JSON UTILS ----------------
 def load_buyers():
     try:
         with open(BUYERS_FILE, "r") as f:
@@ -46,114 +45,135 @@ def add_buyer(uid: int):
         save_buyers(buyers)
 
 
-# ---------------- KEYBOARD ----------------
-def kb_menu(uid: int):
-    kb = InlineKeyboardMarkup()
+# ---------------- TELEGRAM UTILS ----------------
+def send_msg(chat_id, text, kb=None):
+    data = {"chat_id": chat_id, "text": text}
 
-    kb.add(
-        InlineKeyboardButton(
-            f"Купить «{TITLE_MAIN}» за {PRICE_MAIN}⭐",
-            callback_data="buy_main"
-        )
-    )
+    if kb:
+        data["reply_markup"] = kb
+
+    requests.post(f"{URL}/sendMessage", json=data)
+
+
+def send_invoice(chat_id, title, price, payload):
+    invoice = {
+        "chat_id": chat_id,
+        "title": title,
+        "description": title,
+        "payload": payload,
+        "provider_token": "",  # Stars → пусто
+        "currency": "XTR",
+        "prices": [{"label": title, "amount": price}],
+    }
+
+    requests.post(f"{URL}/sendInvoice", json=invoice)
+
+
+# ---------------- KEYBOARD ----------------
+def menu_kb(uid):
+    kb = {"inline_keyboard": []}
+
+    kb["inline_keyboard"].append([
+        {"text": f"Купить «{TITLE_MAIN}» за {PRICE_MAIN}⭐", "callback_data": "buy_main"}
+    ])
 
     if user_has_main(uid):
-        kb.add(
-            InlineKeyboardButton(
-                f"Купить «{TITLE_EXTRA}» за {PRICE_EXTRA}⭐",
-                callback_data="buy_extra"
-            )
-        )
+        kb["inline_keyboard"].append([
+            {"text": f"Купить «{TITLE_EXTRA}» за {PRICE_EXTRA}⭐", "callback_data": "buy_extra"}
+        ])
 
     return kb
 
 
-# ---------------- START ----------------
-@dp.message_handler(commands=['start'])
-async def start(msg: types.Message):
-    await msg.answer("Меню покупок:", reply_markup=kb_menu(msg.from_user.id))
+# ---------------- LOGIC ----------------
+def handle_callback(uid, callback_id, data):
+    if data == "buy_main":
+        send_invoice(uid, TITLE_MAIN, PRICE_MAIN, "main")
+    elif data == "buy_extra":
+        if not user_has_main(uid):
+            answer_cb(callback_id, "Сначала купите товар за 300⭐", alert=True)
+            return
+        send_invoice(uid, TITLE_EXTRA, PRICE_EXTRA, "extra")
+
+    answer_cb(callback_id)
 
 
-# ---------------- BUY MAIN ----------------
-@dp.callback_query_handler(lambda c: c.data == "buy_main")
-async def buy_main(call: types.CallbackQuery):
-    prices = [LabeledPrice(label=TITLE_MAIN, amount=PRICE_MAIN)]
-    await bot.send_invoice(
-        call.from_user.id,
-        title=TITLE_MAIN,
-        description="Покупка основного товара",
-        payload="main",
-        provider_token="",  # пусто для Stars
-        currency="XTR",
-        prices=prices
+def answer_cb(callback_id, text="", alert=False):
+    requests.post(
+        f"{URL}/answerCallbackQuery",
+        json={"callback_query_id": callback_id, "text": text, "show_alert": alert},
     )
-    await call.answer()
 
 
-# ---------------- BUY EXTRA ----------------
-@dp.callback_query_handler(lambda c: c.data == "buy_extra")
-async def buy_extra(call: types.CallbackQuery):
-    if not user_has_main(call.from_user.id):
-        await call.answer("Сначала купите товар за 300⭐", show_alert=True)
-        return
+def handle_payment(msg):
+    uid = msg["from"]["id"]
+    payload = msg["successful_payment"]["invoice_payload"]
 
-    prices = [LabeledPrice(label=TITLE_EXTRA, amount=PRICE_EXTRA)]
-    await bot.send_invoice(
-        call.from_user.id,
-        title=TITLE_EXTRA,
-        description="Покупка дополнительного товара",
-        payload="extra",
-        provider_token="",
-        currency="XTR",
-        prices=prices
-    )
-    await call.answer()
-
-
-# ---------------- PAYMENT CHECKOUT ----------------
-@dp.pre_checkout_query_handler(lambda q: True)
-async def checkout(pre: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre.id, ok=True)
-
-
-# ---------------- SUCCESSFUL PAYMENT ----------------
-@dp.message_handler(content_types=types.ContentTypes.SUCCESSFUL_PAYMENT)
-async def paid(msg: types.Message):
-    uid = msg.from_user.id
-    payload = msg.successful_payment.invoice_payload
-
-    # MAIN ITEM
     if payload == "main":
         add_buyer(uid)
-
-        txt_user = f"Активировано: {TITLE_MAIN}"
-        txt_admin = (
+        user_msg = f"Активировано: {TITLE_MAIN}"
+        admin_msg = (
             f"📩 Новый заказ!\n"
-            f"Покупатель: @{msg.from_user.username or 'нет'}\n"
+            f"Покупатель: @{msg['from'].get('username','нет')}\n"
             f"ID: {uid}\n"
             f"Товар: {TITLE_MAIN}\n"
             f"Оплата: {PRICE_MAIN}⭐"
         )
-
-    # EXTRA ITEM
-    elif payload == "extra":
-        txt_user = f"Активировано: {TITLE_EXTRA}"
-        txt_admin = (
+    else:
+        user_msg = f"Активировано: {TITLE_EXTRA}"
+        admin_msg = (
             f"📩 Новый заказ!\n"
-            f"Покупатель: @{msg.from_user.username or 'нет'}\n"
+            f"Покупатель: @{msg['from'].get('username','нет')}\n"
             f"ID: {uid}\n"
             f"Товар: {TITLE_EXTRA}\n"
             f"Оплата: {PRICE_EXTRA}⭐"
         )
 
-    else:
-        return
-
-    await msg.answer(txt_user)
-    await bot.send_message(ADMIN_CHANNEL, txt_admin)
-    await msg.answer("Меню обновлено:", reply_markup=kb_menu(uid))
+    send_msg(uid, user_msg)
+    send_msg(ADMIN_CHANNEL, admin_msg)
+    send_msg(uid, "Меню обновлено:", kb=menu_kb(uid))
 
 
-# ---------------- RUN ----------------
+# ---------------- POLLING ----------------
+offset = 0
+
+
+def poll():
+    global offset
+
+    while True:
+        r = requests.get(f"{URL}/getUpdates", params={"timeout": 50, "offset": offset})
+        res = r.json()
+
+        if not res.get("ok"):
+            time.sleep(1)
+            continue
+
+        for upd in res["result"]:
+            offset = upd["update_id"] + 1
+
+            # START
+            if "message" in upd and upd["message"].get("text") == "/start":
+                uid = upd["message"]["from"]["id"]
+                send_msg(uid, "Меню покупок:", kb=menu_kb(uid))
+
+            # CALLBACK
+            if "callback_query" in upd:
+                cb = upd["callback_query"]
+                handle_callback(cb["from"]["id"], cb["id"], cb["data"])
+
+            # PAYMENT
+            if "message" in upd and "successful_payment" in upd["message"]:
+                handle_payment(upd["message"])
+
+        time.sleep(1)
+
+
+# ---------------- FLASK ENTRY ----------------
+@app.route("/")
+def hello():
+    return "Bot is running"
+
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    poll()
