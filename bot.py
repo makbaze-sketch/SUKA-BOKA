@@ -1,15 +1,10 @@
-import asyncio
 import json
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    PreCheckoutQuery,
-    LabeledPrice,
-)
-from aiogram.filters import Command
+import logging
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
 import os
+
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHANNEL = -1003371815477
@@ -23,10 +18,10 @@ TITLE_EXTRA = "Дополнительный актив"
 BUYERS_FILE = "buyers.json"
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 
-# ---------- JSON STORAGE ----------
+# ---------------- JSON STORAGE ----------------
 def load_buyers():
     try:
         with open(BUYERS_FILE, "r") as f:
@@ -44,57 +39,60 @@ def user_has_main(uid: int):
     return uid in load_buyers()
 
 
-def add_main_buyer(uid: int):
+def add_buyer(uid: int):
     buyers = load_buyers()
     if uid not in buyers:
         buyers.append(uid)
         save_buyers(buyers)
 
 
-# ---------- KEYBOARD ----------
-def kb_menu(user_id: int):
-    btns = [
-        [InlineKeyboardButton(
-            text=f"Купить «{TITLE_MAIN}» за {PRICE_MAIN}⭐",
-            callback_data="buy_main"
-        )]
-    ]
+# ---------------- KEYBOARD ----------------
+def kb_menu(uid: int):
+    kb = InlineKeyboardMarkup()
 
-    if user_has_main(user_id):
-        btns.append([
+    kb.add(
+        InlineKeyboardButton(
+            f"Купить «{TITLE_MAIN}» за {PRICE_MAIN}⭐",
+            callback_data="buy_main"
+        )
+    )
+
+    if user_has_main(uid):
+        kb.add(
             InlineKeyboardButton(
-                text=f"Купить «{TITLE_EXTRA}» за {PRICE_EXTRA}⭐",
+                f"Купить «{TITLE_EXTRA}» за {PRICE_EXTRA}⭐",
                 callback_data="buy_extra"
             )
-        ])
+        )
 
-    return InlineKeyboardMarkup(inline_keyboard=btns)
+    return kb
 
 
-# ---------- START ----------
-@dp.message(Command("start"))
-async def start(msg: Message):
+# ---------------- START ----------------
+@dp.message_handler(commands=['start'])
+async def start(msg: types.Message):
     await msg.answer("Меню покупок:", reply_markup=kb_menu(msg.from_user.id))
 
 
-# ---------- BUY MAIN ----------
-@dp.callback_query(F.data == "buy_main")
-async def cb_main(call):
+# ---------------- BUY MAIN ----------------
+@dp.callback_query_handler(lambda c: c.data == "buy_main")
+async def buy_main(call: types.CallbackQuery):
     prices = [LabeledPrice(label=TITLE_MAIN, amount=PRICE_MAIN)]
     await bot.send_invoice(
         call.from_user.id,
         title=TITLE_MAIN,
-        description="Основной товар",
+        description="Покупка основного товара",
+        payload="main",
+        provider_token="",  # пусто для Stars
         currency="XTR",
-        prices=prices,
-        payload="main_buy",
+        prices=prices
     )
     await call.answer()
 
 
-# ---------- BUY EXTRA ----------
-@dp.callback_query(F.data == "buy_extra")
-async def cb_extra(call):
+# ---------------- BUY EXTRA ----------------
+@dp.callback_query_handler(lambda c: c.data == "buy_extra")
+async def buy_extra(call: types.CallbackQuery):
     if not user_has_main(call.from_user.id):
         await call.answer("Сначала купите товар за 300⭐", show_alert=True)
         return
@@ -103,28 +101,31 @@ async def cb_extra(call):
     await bot.send_invoice(
         call.from_user.id,
         title=TITLE_EXTRA,
-        description="Дополнительный товар",
+        description="Покупка дополнительного товара",
+        payload="extra",
+        provider_token="",
         currency="XTR",
-        prices=prices,
-        payload="extra_buy",
+        prices=prices
     )
     await call.answer()
 
 
-# ---------- PAYMENT ----------
-@dp.pre_checkout_query()
-async def pre(pre: PreCheckoutQuery):
+# ---------------- PAYMENT CHECKOUT ----------------
+@dp.pre_checkout_query_handler(lambda q: True)
+async def checkout(pre: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre.id, ok=True)
 
 
-@dp.message(F.successful_payment)
-async def paid(msg: Message):
+# ---------------- SUCCESSFUL PAYMENT ----------------
+@dp.message_handler(content_types=types.ContentTypes.SUCCESSFUL_PAYMENT)
+async def paid(msg: types.Message):
     uid = msg.from_user.id
     payload = msg.successful_payment.invoice_payload
 
-    # MAIN
-    if payload == "main_buy":
-        add_main_buyer(uid)
+    # MAIN ITEM
+    if payload == "main":
+        add_buyer(uid)
+
         txt_user = f"Активировано: {TITLE_MAIN}"
         txt_admin = (
             f"📩 Новый заказ!\n"
@@ -134,8 +135,8 @@ async def paid(msg: Message):
             f"Оплата: {PRICE_MAIN}⭐"
         )
 
-    # EXTRA
-    elif payload == "extra_buy":
+    # EXTRA ITEM
+    elif payload == "extra":
         txt_user = f"Активировано: {TITLE_EXTRA}"
         txt_admin = (
             f"📩 Новый заказ!\n"
@@ -153,9 +154,6 @@ async def paid(msg: Message):
     await msg.answer("Меню обновлено:", reply_markup=kb_menu(uid))
 
 
-# ---------- RUN ----------
-async def main():
-    await dp.start_polling(bot)
-
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True)
